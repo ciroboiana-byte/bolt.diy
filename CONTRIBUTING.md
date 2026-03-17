@@ -31,8 +31,11 @@ deployed using [CloudFlare Pages](https://pages.cloudflare.com/) and
 ### AI SDK Integration
 
 Bolt uses the [AI SDK](https://github.com/vercel/ai) to integrate with AI
-models. At this time, Bolt supports using Anthropic's Claude Sonnet 3.5.
-You can get an API key from the [Anthropic API Console](https://console.anthropic.com/) to use with Bolt.
+models. Bolt supports the following LLM providers:
+
+- **Anthropic** (default): Claude Sonnet 3.5. Get an API key from the [Anthropic API Console](https://console.anthropic.com/).
+- **MiniMax**: MiniMax-M2.5 and MiniMax-M2.5-highspeed (204K context). Get an API key from the [MiniMax Platform](https://platform.minimax.io/).
+
 Take a look at how [Bolt uses the AI SDK](https://github.com/stackblitz/bolt.new/tree/main/app/lib/.server/llm)
 
 ## Prerequisites
@@ -56,10 +59,15 @@ git clone https://github.com/stackblitz/bolt.new.git
 pnpm install
 ```
 
-3. Create a `.env.local` file in the root directory and add your Anthropic API key:
+3. Create a `.env.local` file in the root directory and add your API key:
 
-```
+```bash
+# Default: Anthropic (Claude)
 ANTHROPIC_API_KEY=XXX
+
+# To use MiniMax instead, set:
+# DEFAULT_LLM_PROVIDER=minimax
+# MINIMAX_API_KEY=XXX
 ```
 
 Optionally, you can set the debug level:
