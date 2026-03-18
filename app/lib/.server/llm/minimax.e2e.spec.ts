@@ -6,7 +6,7 @@ const BASE_URL = env.MINIMAX_BASE_URL || 'https://api.minimax.io/v1';
 
 describe.skipIf(!API_KEY)('MiniMax E2E', () => {
   it(
-    'completes basic chat with MiniMax-M2.5',
+    'completes basic chat with MiniMax-M2.7',
     async () => {
       const response = await fetch(`${BASE_URL}/chat/completions`, {
         method: 'POST',
@@ -15,7 +15,7 @@ describe.skipIf(!API_KEY)('MiniMax E2E', () => {
           Authorization: `Bearer ${API_KEY}`,
         },
         body: JSON.stringify({
-          model: 'MiniMax-M2.5',
+          model: 'MiniMax-M2.7',
           messages: [{ role: 'user', content: 'Say "test passed"' }],
           max_tokens: 20,
           temperature: 1.0,
@@ -42,7 +42,7 @@ describe.skipIf(!API_KEY)('MiniMax E2E', () => {
           Authorization: `Bearer ${API_KEY}`,
         },
         body: JSON.stringify({
-          model: 'MiniMax-M2.5',
+          model: 'MiniMax-M2.7',
           messages: [{ role: 'user', content: 'Count 1 to 3' }],
           max_tokens: 50,
           stream: true,
@@ -82,7 +82,7 @@ describe.skipIf(!API_KEY)('MiniMax E2E', () => {
   );
 
   it(
-    'works with MiniMax-M2.5-highspeed model',
+    'works with MiniMax-M2.7-highspeed model',
     async () => {
       const response = await fetch(`${BASE_URL}/chat/completions`, {
         method: 'POST',
@@ -91,7 +91,7 @@ describe.skipIf(!API_KEY)('MiniMax E2E', () => {
           Authorization: `Bearer ${API_KEY}`,
         },
         body: JSON.stringify({
-          model: 'MiniMax-M2.5-highspeed',
+          model: 'MiniMax-M2.7-highspeed',
           messages: [{ role: 'user', content: 'Say "highspeed test passed"' }],
           max_tokens: 20,
           temperature: 1.0,
