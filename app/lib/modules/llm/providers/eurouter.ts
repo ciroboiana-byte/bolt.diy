@@ -24,6 +24,56 @@ export default class EUrouterProvider extends BaseProvider {
     { name: 'minimax-m2.5', label: 'MiniMax M2.5', provider: 'EUrouter', maxTokenAllowed: 128000 },
   ];
 
+  async getDynamicModels(
+    apiKeys?: Record<string, string>,
+    settings?: IProviderSetting,
+    serverEnv?: Record<string, string>,
+  ): Promise<ModelInfo[]> {
+    const { apiKey } = this.getProviderBaseUrlAndKey({
+      apiKeys,
+      providerSettings: settings,
+      serverEnv: serverEnv as any,
+      defaultBaseUrlKey: '',
+      defaultApiTokenKey: 'EUROUTER_API_KEY',
+    });
+
+    if (!apiKey) {
+      return [];
+    }
+
+    try {
+      const response = await fetch('https://api.eurouter.ai/api/v1/models', {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+        },
+        signal: this.createTimeoutSignal(5000),
+      });
+
+      if (!response.ok) {
+        console.error(`EUrouter API error: ${response.statusText}`);
+        return [];
+      }
+
+      const data = (await response.json()) as any;
+      const staticModelIds = this.staticModels.map((m) => m.name);
+
+      const dynamicModels =
+        data.data
+          ?.filter((model: any) => !staticModelIds.includes(model.id))
+          .map((m: any) => ({
+            name: m.id,
+            label: m.id,
+            provider: this.name,
+            maxTokenAllowed: 128000,
+          })) || [];
+
+      return dynamicModels;
+    } catch (error) {
+      console.error('Failed to fetch EUrouter models:', error);
+      return [];
+    }
+  }
+
   getModelInstance(options: {
     model: string;
     serverEnv: Env;
