@@ -97,6 +97,10 @@ export default class EUrouterProvider extends BaseProvider {
     const openai = createOpenAI({
       baseURL: 'https://api.eurouter.ai/api/v1',
       apiKey,
+      headers: {
+        'HTTP-Referer': 'https://bolt.diy',
+        'X-EUrouter-Title': 'bolt.diy',
+      },
     });
 
     return openai(model);
