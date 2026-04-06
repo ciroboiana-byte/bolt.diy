@@ -2,6 +2,7 @@ import AnthropicProvider from './providers/anthropic';
 import CerebrasProvider from './providers/cerebras';
 import CohereProvider from './providers/cohere';
 import DeepseekProvider from './providers/deepseek';
+import EUrouterProvider from './providers/eurouter';
 import FireworksProvider from './providers/fireworks';
 import GoogleProvider from './providers/google';
 import GroqProvider from './providers/groq';
@@ -26,6 +27,7 @@ export {
   CerebrasProvider,
   CohereProvider,
   DeepseekProvider,
+  EUrouterProvider,
   FireworksProvider,
   GoogleProvider,
   GroqProvider,
