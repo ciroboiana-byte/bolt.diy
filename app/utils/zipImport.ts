@@ -52,6 +52,7 @@ export interface ZipImportResult {
   skippedIgnored: number;
   totalFiles: number;
   hasPackageJson: boolean;
+  hasExpoConfig: boolean;
 }
 
 /**
@@ -112,6 +113,51 @@ export const createChatFromZip = async (zipFile: File): Promise<ZipImportResult>
   // Detect whether this is a Node project so we can craft the follow-up prompt
   const hasPackageJson = fileArtifacts.some((f) => f.path === 'package.json' || f.path.endsWith('/package.json'));
 
+  /*
+   * Detect Expo/React Native projects so we can suppress the "npm install
+   * and start dev server" prompt — WebContainer can't run native mobile code.
+   * We check for app.json / app.config.js (Expo-specific config files) or
+   * an "expo" key in the package.json dependencies.
+   */
+  const hasExpoConfig =
+    fileArtifacts.some((f) => f.path === 'app.json' || f.path === 'app.config.js' || f.path === 'app.config.ts') ||
+    fileArtifacts.some((f) => {
+      if (f.path !== 'package.json') {
+        return false;
+      }
+
+      try {
+        const pkg = JSON.parse(f.content);
+        return !!(pkg.dependencies?.expo || pkg.devDependencies?.expo);
+      } catch {
+        return false;
+      }
+    });
+
+  /*
+   * For Expo projects, strip the scripts from package.json so bolt has
+   * nothing to execute even if it tries. The user will run the project
+   * locally with Expo CLI. We preserve the rest of package.json intact.
+   */
+  if (hasExpoConfig) {
+    const pkgIndex = fileArtifacts.findIndex((f) => f.path === 'package.json');
+
+    if (pkgIndex !== -1) {
+      try {
+        const pkg = JSON.parse(fileArtifacts[pkgIndex].content);
+        pkg.scripts = {
+          _note: 'Run this project locally: npx expo start',
+        };
+        fileArtifacts[pkgIndex] = {
+          ...fileArtifacts[pkgIndex],
+          content: JSON.stringify(pkg, null, 2),
+        };
+      } catch {
+        /* If package.json is unparseable, leave it as-is */
+      }
+    }
+  }
+
   const folderName = zipFile.name.replace(/\.zip$/i, '');
 
   const binaryFilesMessage =
@@ -151,5 +197,6 @@ ${escapeBoltTags(file.content)}
     skippedIgnored,
     totalFiles: fileArtifacts.length + binaryFilePaths.length + skippedIgnored,
     hasPackageJson,
+    hasExpoConfig,
   };
 };
