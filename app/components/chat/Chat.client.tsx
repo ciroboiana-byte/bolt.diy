@@ -21,6 +21,7 @@ import { createSampler } from '~/utils/sampler';
 import { getTemplates, selectStarterTemplate } from '~/utils/selectStarterTemplate';
 import { logStore } from '~/lib/stores/logs';
 import { streamingState } from '~/lib/stores/streaming';
+import { promptQueueStore, advanceQueue, clearPendingPrompt, stopQueue } from '~/lib/stores/promptQueue';
 import { filesToArtifacts } from '~/utils/fileUtils';
 import { supabaseConnection } from '~/lib/stores/supabase';
 import { defaultDesignScheme, type DesignScheme } from '~/types/design-scheme';
@@ -154,6 +155,7 @@ export const ChatImpl = memo(
       onError: (e) => {
         setFakeLoading(false);
         handleError(e, 'chat');
+        stopQueue();
       },
       onFinish: (message, response) => {
         const usage = response.usage;
@@ -172,6 +174,16 @@ export const ChatImpl = memo(
         }
 
         logger.debug('Finished streaming');
+
+        /* Advance the prompt queue if one is running */
+        const nextPrompt = advanceQueue();
+
+        if (nextPrompt) {
+          /* Small delay so the UI can settle before the next message fires */
+          setTimeout(() => {
+            promptQueueStore.setKey('pendingPrompt', nextPrompt);
+          }, 800);
+        }
       },
       initialMessages,
       initialInput: Cookies.get(PROMPT_COOKIE_KEY) || '',
@@ -199,6 +211,38 @@ export const ChatImpl = memo(
     useEffect(() => {
       chatStore.setKey('started', initialMessages.length > 0);
     }, []);
+
+    /*
+     * Pre-fill the textarea with the follow-up prompt set by ImportZipButton before the
+     * full-page navigation. Using setInput instead of append so the user confirms with
+     * one Enter keystroke — avoids model-state race conditions on chat initialisation.
+     */
+    useEffect(() => {
+      if (initialMessages.length === 0) {
+        return;
+      }
+
+      const autorun = localStorage.getItem('bolt_zip_autorun');
+
+      if (autorun) {
+        localStorage.removeItem('bolt_zip_autorun');
+        setInput(autorun);
+      }
+    }, []);
+
+    /* Fire the next queued prompt whenever the store signals one is ready */
+    useEffect(() => {
+      const unsubscribe = promptQueueStore.subscribe((state) => {
+        if (state.pendingPrompt) {
+          clearPendingPrompt();
+
+          const messageText = `[Model: ${model}]\n\n[Provider: ${provider.name}]\n\n${state.pendingPrompt}`;
+          append({ role: 'user', content: messageText });
+        }
+      });
+
+      return unsubscribe;
+    }, [append, model, provider]);
 
     useEffect(() => {
       processSampledMessages({
