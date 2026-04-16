@@ -1,6 +1,7 @@
 import { getSystemPrompt } from './prompts/prompts';
 import optimized from './prompts/optimized';
 import { getFineTunedPrompt } from './prompts/new-prompt';
+import getSlimPrompt from './prompts/slim';
 import type { DesignScheme } from '~/types/design-scheme';
 
 export interface PromptOptions {
@@ -41,6 +42,12 @@ export class PromptLibrary {
       label: 'Optimized Prompt (experimental)',
       description: 'An Experimental version of the prompt for lower token usage',
       get: (options) => optimized(options),
+    },
+    slim: {
+      label: 'Slim Prompt (local models)',
+      description:
+        'Minimal prompt for local small models (7B–13B). Strips WebContainer constraints and verbose copy — keeps only boltArtifact format and essential rules.',
+      get: (options) => getSlimPrompt(options),
     },
   };
   static getList() {
