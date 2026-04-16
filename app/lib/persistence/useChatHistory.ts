@@ -215,8 +215,8 @@ ${value.content}
       try {
         await setSnapshot(db, id, snapshot);
       } catch (error) {
-        console.error('Failed to save snapshot:', error);
-        toast.error('Failed to save chat snapshot.');
+        /* Log silently — snapshot failures under resource pressure are not actionable; toasts cascade into a flood that makes the UI unusable. */
+        console.warn('Failed to save snapshot:', error);
       }
     },
     [db],

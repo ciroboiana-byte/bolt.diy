@@ -2,7 +2,7 @@ import { useStore } from '@nanostores/react';
 import type { Message } from 'ai';
 import { useChat } from '@ai-sdk/react';
 import { useAnimate } from 'framer-motion';
-import { memo, useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, startTransition, useState } from 'react';
 import { toast } from 'react-toastify';
 import { useMessageParser, usePromptEnhancer, useShortcuts } from '~/lib/hooks';
 import { description, useChatHistory } from '~/lib/persistence';
@@ -21,6 +21,8 @@ import { createSampler } from '~/utils/sampler';
 import { getTemplates, selectStarterTemplate } from '~/utils/selectStarterTemplate';
 import { logStore } from '~/lib/stores/logs';
 import { streamingState } from '~/lib/stores/streaming';
+import { promptQueueStore, advanceQueue, clearPendingPrompt, stopQueue } from '~/lib/stores/promptQueue';
+import { localLLMSettingsStore, getTokenBudget, estimateTokens } from '~/lib/stores/localLLMSettings';
 import { filesToArtifacts } from '~/utils/fileUtils';
 import { supabaseConnection } from '~/lib/stores/supabase';
 import { defaultDesignScheme, type DesignScheme } from '~/types/design-scheme';
@@ -67,7 +69,34 @@ const processSampledMessages = createSampler(
     parseMessages(messages, isLoading);
 
     if (messages.length > initialMessages.length) {
-      storeMessageHistory(messages).catch((error) => toast.error(error.message));
+      /*
+       * Defer IndexedDB writes to avoid blocking the render thread.
+       * requestIdleCallback fires when the browser is idle between frames;
+       * setTimeout(0) is the fallback for browsers that don't support it.
+       */
+      const saveHistory = () => {
+        storeMessageHistory(messages).catch((error) => {
+          /*
+           * Suppress network/resource exhaustion errors — not actionable by the user
+           * and cascade into a flood of toasts when the browser is under memory pressure.
+           */
+          const msg: string = error?.message ?? '';
+          const isResourceError =
+            msg.includes('Failed to fetch') || msg.includes('ERR_INSUFFICIENT') || msg.includes('NetworkError');
+
+          if (!isResourceError) {
+            toast.error(msg);
+          } else {
+            console.warn('Chat history save failed (resource pressure):', msg);
+          }
+        });
+      };
+
+      if (typeof requestIdleCallback !== 'undefined') {
+        requestIdleCallback(saveHistory, { timeout: 2000 });
+      } else {
+        setTimeout(saveHistory, 0);
+      }
     }
   },
   50,
@@ -101,6 +130,10 @@ export const ChatImpl = memo(
     );
     const supabaseAlert = useStore(workbenchStore.supabaseAlert);
     const { activeProviders, promptId, autoSelectTemplate, contextOptimizationEnabled } = useSettings();
+    const localLLMSettings = useStore(localLLMSettingsStore);
+
+    // When slim system prompt is enabled, override promptId to 'slim'
+    const effectivePromptId = localLLMSettings.slimSystemPrompt ? 'slim' : promptId;
     const [llmErrorAlert, setLlmErrorAlert] = useState<LlmErrorAlertType | undefined>(undefined);
     const [model, setModel] = useState(() => {
       const savedModel = Cookies.get('selectedModel');
@@ -136,8 +169,20 @@ export const ChatImpl = memo(
       body: {
         apiKeys,
         files,
-        promptId,
-        contextOptimization: contextOptimizationEnabled,
+        promptId: effectivePromptId,
+
+        /*
+         * Disable bolt's context-file-selection pass when local models are
+         * active — it runs a separate LLM call that times out with Ollama,
+         * and fails on new files that don't exist in WebContainer yet.
+         */
+        /*
+         * Context optimization is now safe for local models — the server wraps both
+         * LLM pre-passes in a timeout and falls back to keyword-based file selection
+         * if Ollama is too slow. Only hard-disable if the user explicitly opted out.
+         */
+        contextOptimization: localLLMSettings.disableContextOptimization ? false : contextOptimizationEnabled,
+        isLocalModel: localLLMSettings.enableLocalModels && localLLMSettings.extendedStreamTimeout,
         chatMode,
         designScheme,
         supabase: {
@@ -154,6 +199,7 @@ export const ChatImpl = memo(
       onError: (e) => {
         setFakeLoading(false);
         handleError(e, 'chat');
+        stopQueue();
       },
       onFinish: (message, response) => {
         const usage = response.usage;
@@ -172,6 +218,204 @@ export const ChatImpl = memo(
         }
 
         logger.debug('Finished streaming');
+
+        /*
+         * Collect all transformation inputs synchronously (before any async yields),
+         * then apply all message mutations in a SINGLE startTransition-wrapped setMessages
+         * call. This prevents 4 separate render cycles for each queue step and keeps the
+         * UI responsive — startTransition marks this batch as non-urgent so React can
+         * yield to user interactions (clicks, scrolls) between work chunks.
+         */
+
+        // Inputs for pass 1: ZIP import compaction
+        const zipFiletreeRaw = localStorage.getItem('bolt_zip_filetree');
+
+        if (zipFiletreeRaw) {
+          localStorage.removeItem('bolt_zip_filetree');
+        }
+
+        // Inputs for pass 2+: queue state and settings
+        const { isRunning } = promptQueueStore.get();
+        const llmSettings = localLLMSettingsStore.get();
+        const tokenBudget = getTokenBudget(llmSettings);
+
+        startTransition(() => {
+          setMessages((prev) => {
+            let msgs = prev;
+
+            // --- Pass 1: ZIP import — replace giant boltArtifact with compact file tree ---
+            if (zipFiletreeRaw) {
+              try {
+                const { folderName, fileCount, tree } = JSON.parse(zipFiletreeRaw);
+                const compactContent = `I've imported the "${folderName}" project (${fileCount} files). All files have been written to the WebContainer filesystem.\n\nProject structure:\n${tree}\n\nFiles are ready — I'll use context selection to pull relevant files as needed for each task.`;
+                msgs = msgs.map((m) =>
+                  m.content.includes('boltArtifact id="imported-files"') ? { ...m, content: compactContent } : m,
+                );
+              } catch {
+                /* ignore parse errors */
+              }
+            }
+
+            // --- Pass 2: Queue artifact pruning — strip boltArtifact from older messages ---
+            if (isRunning) {
+              const assistantMsgs = msgs.filter((m) => m.role === 'assistant');
+              const keepRecent = 2;
+              const pruneCount = Math.max(0, assistantMsgs.length - keepRecent);
+
+              if (pruneCount > 0) {
+                let pruned = 0;
+                msgs = msgs.map((m) => {
+                  if (m.role !== 'assistant' || pruned >= pruneCount) {
+                    return m;
+                  }
+
+                  if (m.content.includes('<boltArtifact')) {
+                    pruned++;
+                    return {
+                      ...m,
+                      content: m.content.replace(
+                        /<boltArtifact[\s\S]*?<\/boltArtifact>/g,
+                        '[files applied to WebContainer]',
+                      ),
+                    };
+                  }
+
+                  return m;
+                });
+              }
+            }
+
+            // --- Pass 3: Local LLM optimizations — dedup file writes and strip old prose ---
+            if (llmSettings.dedupFileWrites || llmSettings.stripOldProse) {
+              if (llmSettings.dedupFileWrites) {
+                /*
+                 * Walk messages newest-first, track file paths already seen.
+                 * For any older write of the same path, replace with a stub so
+                 * the model doesn't re-read stale file versions.
+                 */
+                const seenPaths = new Set<string>();
+
+                msgs = msgs
+                  .slice()
+                  .reverse()
+                  .map((m) => {
+                    if (m.role !== 'assistant' || !m.content.includes('<boltArtifact')) {
+                      return m;
+                    }
+
+                    const newContent = m.content.replace(
+                      /<boltAction type="file" filePath="([^"]+)">([\s\S]*?)<\/boltAction>/g,
+                      (match, filePath) => {
+                        if (seenPaths.has(filePath)) {
+                          return `<boltAction type="file" filePath="${filePath}">[superseded by later write]</boltAction>`;
+                        }
+
+                        seenPaths.add(filePath);
+
+                        return match;
+                      },
+                    );
+
+                    return newContent !== m.content ? { ...m, content: newContent } : m;
+                  })
+                  .reverse();
+              }
+
+              if (llmSettings.stripOldProse) {
+                /*
+                 * For assistant messages older than the last 2, strip everything
+                 * outside <boltArtifact> tags. The prose is already read — keeping
+                 * it is pure token cost.
+                 */
+                const assistantIndices = msgs.map((m, i) => (m.role === 'assistant' ? i : -1)).filter((i) => i >= 0);
+                const pruneSet = new Set(assistantIndices.slice(0, Math.max(0, assistantIndices.length - 2)));
+
+                msgs = msgs.map((m, i) => {
+                  if (!pruneSet.has(i)) {
+                    return m;
+                  }
+
+                  if (!m.content.includes('<boltArtifact')) {
+                    return { ...m, content: '[response]' };
+                  }
+
+                  const artifacts = [...m.content.matchAll(/<boltArtifact[\s\S]*?<\/boltArtifact>/g)]
+                    .map((match) => match[0])
+                    .join('\n');
+
+                  return { ...m, content: artifacts || '[response]' };
+                });
+              }
+            }
+
+            // --- Pass 4: Token-budget pruning — trim oldest messages until under budget ---
+            if (tokenBudget !== null) {
+              const totalTokens = msgs.reduce((sum, m) => sum + estimateTokens(String(m.content)), 0);
+
+              if (totalTokens > tokenBudget) {
+                const KEEP_TAIL = 4;
+
+                if (msgs.length > KEEP_TAIL + 1) {
+                  const head = msgs.slice(0, 1);
+                  const tail = msgs.slice(-KEEP_TAIL);
+                  let middle = msgs.slice(1, -KEEP_TAIL);
+
+                  while (
+                    middle.length > 0 &&
+                    head.concat(middle, tail).reduce((sum, m) => sum + estimateTokens(String(m.content)), 0) >
+                      tokenBudget
+                  ) {
+                    middle = middle.slice(1);
+                  }
+
+                  msgs = [...head, ...middle, ...tail];
+                }
+              }
+            }
+
+            return msgs;
+          });
+        });
+
+        /* Advance the prompt queue if one is running */
+        const nextPrompt = advanceQueue();
+
+        if (nextPrompt) {
+          /* Small delay so the UI can settle before the next message fires */
+          /*
+           * Wait for the action runner to fully settle (all file writes / shell
+           * commands reach a terminal state) before firing the next prompt.
+           * This prevents WebContainer from being overwhelmed by rapid-fire writes.
+           * Falls back after maxWaitMs regardless so the queue never stalls forever.
+           */
+          const waitForActionsToSettle = (maxWaitMs = 60_000): Promise<void> =>
+            new Promise((resolve) => {
+              const deadline = Date.now() + maxWaitMs;
+
+              const check = () => {
+                const artifacts = workbenchStore.artifacts.get();
+                const anyBusy = Object.values(artifacts).some((artifact) =>
+                  Object.values(artifact.runner.actions.get()).some(
+                    (action) => action.status === 'running' || action.status === 'pending',
+                  ),
+                );
+
+                if (!anyBusy || Date.now() >= deadline) {
+                  // Extra breathing room after actions settle so WebContainer can flush I/O
+                  setTimeout(resolve, 1500);
+                } else {
+                  setTimeout(check, 500);
+                }
+              };
+
+              // Give the action runner a moment to start before we start polling
+              setTimeout(check, 1000);
+            });
+
+          waitForActionsToSettle().then(() => {
+            promptQueueStore.setKey('pendingPrompt', nextPrompt);
+          });
+        }
       },
       initialMessages,
       initialInput: Cookies.get(PROMPT_COOKIE_KEY) || '',
@@ -199,6 +443,38 @@ export const ChatImpl = memo(
     useEffect(() => {
       chatStore.setKey('started', initialMessages.length > 0);
     }, []);
+
+    /*
+     * Pre-fill the textarea with the follow-up prompt set by ImportZipButton before the
+     * full-page navigation. Using setInput instead of append so the user confirms with
+     * one Enter keystroke — avoids model-state race conditions on chat initialisation.
+     */
+    useEffect(() => {
+      if (initialMessages.length === 0) {
+        return;
+      }
+
+      const autorun = localStorage.getItem('bolt_zip_autorun');
+
+      if (autorun) {
+        localStorage.removeItem('bolt_zip_autorun');
+        setInput(autorun);
+      }
+    }, []);
+
+    /* Fire the next queued prompt whenever the store signals one is ready */
+    useEffect(() => {
+      const unsubscribe = promptQueueStore.subscribe((state) => {
+        if (state.pendingPrompt) {
+          clearPendingPrompt();
+
+          const messageText = `[Model: ${model}]\n\n[Provider: ${provider.name}]\n\n${state.pendingPrompt}`;
+          append({ role: 'user', content: messageText });
+        }
+      });
+
+      return unsubscribe;
+    }, [append, model, provider]);
 
     useEffect(() => {
       processSampledMessages({
