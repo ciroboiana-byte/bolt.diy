@@ -42,7 +42,16 @@ export const ImportZipButton: React.FC<ImportZipButtonProps> = ({ className, imp
        * importChat does a full window.location.href redirect, so append()
        * would be gone by the time it resolves.
        */
-      if (result.hasPackageJson) {
+      if (result.hasExpoConfig) {
+        /*
+         * Expo/React Native — WebContainer can't run native code.
+         * Ask bolt to review the code instead of trying to boot the project.
+         */
+        localStorage.setItem(
+          'bolt_zip_autorun',
+          'This is an Expo/React Native project. Review the code structure and give me a summary of what the app does and how it is organized. Do not run any install or dev server commands — I will run this locally with Expo CLI.',
+        );
+      } else if (result.hasPackageJson) {
         localStorage.setItem('bolt_zip_autorun', 'Install the dependencies and start the development server.');
       }
 
