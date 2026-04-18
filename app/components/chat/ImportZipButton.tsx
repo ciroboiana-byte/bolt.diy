@@ -42,7 +42,26 @@ export const ImportZipButton: React.FC<ImportZipButtonProps> = ({ className, imp
        * importChat does a full window.location.href redirect, so append()
        * would be gone by the time it resolves.
        */
-      if (result.hasExpoConfig) {
+      /*
+       * Store file tree so Chat.client can replace the giant artifact message
+       * with a compact summary after bolt has written the files to WebContainer.
+       */
+      localStorage.setItem(
+        'bolt_zip_filetree',
+        JSON.stringify({
+          folderName: file.name.replace(/\.zip$/i, ''),
+          fileCount: result.totalFiles - result.skippedBinary - result.skippedIgnored,
+          tree: result.fileTreeSummary,
+        }),
+      );
+
+      if (result.boltPrompt) {
+        /*
+         * Project includes a .bolt/prompt file — use its contents verbatim
+         * as the auto-fill first message, overriding all defaults.
+         */
+        localStorage.setItem('bolt_zip_autorun', result.boltPrompt);
+      } else if (result.hasExpoConfig) {
         /*
          * Expo/React Native — WebContainer can't run native code.
          * Ask bolt to review the code instead of trying to boot the project.

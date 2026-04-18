@@ -53,6 +53,21 @@ export interface ZipImportResult {
   totalFiles: number;
   hasPackageJson: boolean;
   hasExpoConfig: boolean;
+  fileTreeSummary: string;
+
+  /** Contents of .bolt/prompt if present in the ZIP — used as the auto-fill first message */
+  boltPrompt: string | null;
+}
+
+/**
+ * Builds a compact file tree string from a list of file paths.
+ * Used to replace the full artifact content in context after import.
+ */
+export function buildFileTreeSummary(paths: string[]): string {
+  return [...paths]
+    .sort()
+    .map((p) => `  ${p}`)
+    .join('\n');
 }
 
 /**
@@ -110,6 +125,20 @@ export const createChatFromZip = async (zipFile: File): Promise<ZipImportResult>
     throw new Error('No readable text files found in the ZIP (all files were binary or ignored).');
   }
 
+  /*
+   * Check for a .bolt/prompt file — its contents become the auto-fill first message,
+   * overriding the default "install deps" / Expo review prompts.
+   * The file is intentionally NOT included in the boltArtifact so bolt doesn't
+   * try to write it into the WebContainer filesystem.
+   */
+  const boltPromptIndex = fileArtifacts.findIndex((f) => f.path === '.bolt/prompt' || f.path === 'bolt/prompt');
+  let boltPrompt: string | null = null;
+
+  if (boltPromptIndex !== -1) {
+    boltPrompt = fileArtifacts[boltPromptIndex].content.trim() || null;
+    fileArtifacts.splice(boltPromptIndex, 1); // Don't send this file to the WebContainer
+  }
+
   // Detect whether this is a Node project so we can craft the follow-up prompt
   const hasPackageJson = fileArtifacts.some((f) => f.path === 'package.json' || f.path.endsWith('/package.json'));
 
@@ -158,6 +187,7 @@ export const createChatFromZip = async (zipFile: File): Promise<ZipImportResult>
     }
   }
 
+  const fileTreeSummary = buildFileTreeSummary(fileArtifacts.map((f) => f.path));
   const folderName = zipFile.name.replace(/\.zip$/i, '');
 
   const binaryFilesMessage =
@@ -198,5 +228,7 @@ ${escapeBoltTags(file.content)}
     totalFiles: fileArtifacts.length + binaryFilePaths.length + skippedIgnored,
     hasPackageJson,
     hasExpoConfig,
+    fileTreeSummary,
+    boltPrompt,
   };
 };

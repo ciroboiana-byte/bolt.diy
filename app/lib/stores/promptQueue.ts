@@ -40,10 +40,39 @@ export function startQueue() {
   });
 }
 
-/** Stop the queue without clearing the prompt list. */
+/** Stop the queue without clearing the prompt list or resetting the index. */
 export function stopQueue() {
   promptQueueStore.setKey('isRunning', false);
   promptQueueStore.setKey('pendingPrompt', null);
+}
+
+/**
+ * Resume a paused queue from the current index.
+ * No-op if already running or if there are no remaining prompts.
+ */
+export function resumeQueue() {
+  const { prompts, currentIndex, isRunning } = promptQueueStore.get();
+
+  if (isRunning || currentIndex >= prompts.length) {
+    return;
+  }
+
+  promptQueueStore.set({
+    prompts,
+    currentIndex,
+    isRunning: true,
+    pendingPrompt: prompts[currentIndex],
+  });
+}
+
+/** Clear the queue entirely and reset all state. */
+export function clearQueue() {
+  promptQueueStore.set({
+    prompts: [],
+    currentIndex: 0,
+    isRunning: false,
+    pendingPrompt: null,
+  });
 }
 
 /**

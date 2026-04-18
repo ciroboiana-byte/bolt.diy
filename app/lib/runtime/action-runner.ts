@@ -262,15 +262,43 @@ export class ActionRunner {
     // Pre-validate command for common issues
     const validationResult = await this.#validateShellCommand(action.content);
 
+    if (validationResult.shouldBlock) {
+      throw new ActionCommandError('Command blocked', validationResult.blockReason ?? 'Command not allowed');
+    }
+
     if (validationResult.shouldModify && validationResult.modifiedCommand) {
       logger.debug(`Modified command: ${action.content} -> ${validationResult.modifiedCommand}`);
       action.content = validationResult.modifiedCommand;
     }
 
-    const resp = await shell.executeCommand(this.runnerId.get(), action.content, () => {
+    /*
+     * Hard timeout — prevents shell commands from hanging bolt indefinitely.
+     * npm install on a large project, dev servers, or WebContainer init issues
+     * can stall forever without this. 90 s is generous for most installs;
+     * long-running dev-server commands use the 'start' action type instead.
+     */
+    const SHELL_TIMEOUT_MS = 90_000;
+
+    const execPromise = shell.executeCommand(this.runnerId.get(), action.content, () => {
       logger.debug(`[${action.type}]:Aborting Action\n\n`, action);
       action.abort();
     });
+
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(
+        () =>
+          reject(
+            new ActionCommandError(
+              'Shell command timed out',
+              `Command did not complete within ${SHELL_TIMEOUT_MS / 1000}s:\n${action.content}`,
+            ),
+          ),
+        SHELL_TIMEOUT_MS,
+      ),
+    );
+
+    const resp = await Promise.race([execPromise, timeoutPromise]);
+
     logger.debug(`${action.type} Shell Response: [exit code:${resp?.exitCode}]`);
 
     if (resp?.exitCode != 0) {
@@ -576,10 +604,48 @@ export class ActionRunner {
 
   async #validateShellCommand(command: string): Promise<{
     shouldModify: boolean;
+    shouldBlock?: boolean;
+    blockReason?: string;
     modifiedCommand?: string;
     warning?: string;
   }> {
     const trimmedCommand = command.trim();
+
+    /*
+     * Blocklist for commands that hang or are meaningless in WebContainer
+     * for local/native projects (React Native, Expo, etc.).
+     * Enabled via the "Block install/server commands" toggle in LocalLLMPanel.
+     */
+    const STORAGE_KEY = 'local_llm_settings';
+
+    try {
+      const saved = typeof localStorage !== 'undefined' ? localStorage.getItem(STORAGE_KEY) : null;
+      const blockEnabled = saved ? (JSON.parse(saved).blockHangingCommands ?? false) : false;
+
+      if (blockEnabled) {
+        const BLOCKED_PATTERNS = [
+          /^(npx\s+)?expo\s+(start|run|build|publish)/i,
+          /^npm\s+(install|i|ci|run\s+start|run\s+dev|run\s+build|start)/i,
+          /^yarn(\s+(install|start|dev|build))?$/i,
+          /^pnpm\s+(install|start|dev|build)/i,
+          /^node\s+/i,
+          /^npx\s+react-native\s+(run|start|build)/i,
+        ];
+
+        for (const pattern of BLOCKED_PATTERNS) {
+          if (pattern.test(trimmedCommand)) {
+            logger.warn(`Blocked shell command (install/server blocklist): ${trimmedCommand}`);
+            return {
+              shouldModify: false,
+              shouldBlock: true,
+              blockReason: `Command blocked: "${trimmedCommand}" — install and server commands are disabled for local/native projects. Run this manually in your local terminal.`,
+            };
+          }
+        }
+      }
+    } catch {
+      /* localStorage unavailable (SSR) — skip blocklist check */
+    }
 
     // Handle rm commands that might fail due to missing files
     if (trimmedCommand.startsWith('rm ') && !trimmedCommand.includes(' -f')) {

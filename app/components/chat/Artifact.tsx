@@ -34,15 +34,21 @@ export const Artifact = memo(({ artifactId }: ArtifactProps) => {
   const artifacts = useStore(workbenchStore.artifacts);
   const artifact = artifacts[artifactId];
 
-  const actions = useStore(
-    computed(artifact.runner.actions, (actions) => {
-      // Filter out Supabase actions except for migrations
-      return Object.values(actions).filter((action) => {
-        // Exclude actions with type 'supabase' or actions that contain 'supabase' in their content
-        return action.type !== 'supabase' && !(action.type === 'shell' && action.content?.includes('supabase'));
-      });
-    }),
+  /*
+   * IMPORTANT: computed() must only be created once per component instance.
+   * Calling it inline recreates the store every render, giving `actions` a new
+   * reference each time and triggering an infinite useEffect → setState loop.
+   * useRef guarantees a single creation — safe because each Artifact mounts once
+   * for a fixed artifactId and artifact.runner never changes for that instance.
+   */
+  const actionsStoreRef = useRef(
+    computed(artifact.runner.actions, (actions) =>
+      Object.values(actions).filter(
+        (action) => action.type !== 'supabase' && !(action.type === 'shell' && action.content?.includes('supabase')),
+      ),
+    ),
   );
+  const actions = useStore(actionsStoreRef.current);
 
   const toggleActions = () => {
     userToggledActions.current = true;
@@ -59,11 +65,14 @@ export const Artifact = memo(({ artifactId }: ArtifactProps) => {
         (action) => action.status !== 'complete' && !(action.type === 'start' && action.status === 'running'),
       );
 
-      if (allActionFinished !== finished) {
-        setAllActionFinished(finished);
-      }
+      /*
+       * Always call setState — React bails out silently if the value hasn't
+       * changed, so this is safe and avoids having allActionFinished in deps
+       * (which would re-trigger this effect every time it updates).
+       */
+      setAllActionFinished(finished);
     }
-  }, [actions, artifact.type, allActionFinished]);
+  }, [actions, artifact.type]);
 
   // Determine the dynamic title based on state for bundled artifacts
   const dynamicTitle =

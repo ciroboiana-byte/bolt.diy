@@ -1,7 +1,7 @@
 import { useStore } from '@nanostores/react';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { toast } from 'react-toastify';
-import { promptQueueStore, loadQueue, startQueue, stopQueue } from '~/lib/stores/promptQueue';
+import { promptQueueStore, loadQueue, startQueue, stopQueue, resumeQueue, clearQueue } from '~/lib/stores/promptQueue';
 import { classNames } from '~/utils/classNames';
 
 /**
@@ -30,6 +30,14 @@ function parsePrompts(raw: string): string[] {
       .filter(Boolean);
   }
 
+  // ####Prompt N#### delimiter style
+  if (/^####[^#\n]+####$/m.test(trimmed)) {
+    return trimmed
+      .split(/^####[^#\n]+####$/m)
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
   if (/^#{1,3} /m.test(trimmed)) {
     return trimmed
       .split(/^#{1,3} .+$/m)
@@ -49,6 +57,8 @@ interface PromptQueuePanelProps {
 
 export function PromptQueuePanel({ isStreaming }: PromptQueuePanelProps) {
   const [isOpen, setIsOpen] = useState(false);
+  const [panelStyle, setPanelStyle] = useState<React.CSSProperties>({});
+  const barRef = useRef<HTMLDivElement>(null);
   const [draft, setDraft] = useState('');
   const { prompts, currentIndex, isRunning } = useStore(promptQueueStore);
 
@@ -64,70 +74,152 @@ export function PromptQueuePanel({ isStreaming }: PromptQueuePanelProps) {
     toast.success(`Loaded ${parsed.length} prompt${parsed.length === 1 ? '' : 's'}`);
   };
 
-  const handleStart = () => {
-    if (prompts.length === 0) {
-      toast.error('Load prompts first');
-      return;
-    }
+  const isAllDone = !isRunning && prompts.length > 0 && currentIndex > 0 && currentIndex === prompts.length;
+  const isPaused = !isRunning && currentIndex > 0 && currentIndex < prompts.length;
+  const hasPrompts = prompts.length > 0;
 
-    if (isStreaming) {
-      toast.error('Wait for the current response to finish');
-      return;
-    }
-
-    startQueue();
-  };
-
-  const handleStop = () => {
-    stopQueue();
-    toast.info('Queue stopped');
-  };
-
-  const isAllDone = !isRunning && currentIndex === prompts.length && prompts.length > 0;
   const progressLabel = isAllDone
     ? `All ${prompts.length} prompts done ✓`
     : isRunning
       ? `Prompt ${currentIndex + 1} of ${prompts.length}`
-      : prompts.length > 0
-        ? `${prompts.length} prompt${prompts.length === 1 ? '' : 's'} loaded`
-        : '';
+      : isPaused
+        ? `Paused at ${currentIndex + 1} of ${prompts.length}`
+        : hasPrompts
+          ? `${prompts.length} prompt${prompts.length === 1 ? '' : 's'} loaded`
+          : '';
+
+  const handleStop = () => {
+    stopQueue();
+    toast.info('Queue paused — current response will finish');
+  };
+
+  const handleClear = () => {
+    clearQueue();
+    setDraft('');
+    toast.info('Queue cleared');
+  };
 
   return (
-    <div className="relative border-t border-bolt-elements-borderColor">
-      {/* Toggle bar — always visible, minimal height */}
-      <button
-        onClick={() => setIsOpen((o) => !o)}
-        className={classNames(
-          'w-full flex items-center justify-between px-4 py-2 text-sm',
-          'bg-bolt-elements-background-depth-1',
-          'text-bolt-elements-textSecondary hover:text-bolt-elements-textPrimary',
-          'hover:bg-bolt-elements-background-depth-2 transition-colors',
-        )}
-      >
-        <span className="flex items-center gap-2">
-          <span className="i-ph:queue w-4 h-4" />
-          <span>Prompt Queue</span>
+    <div ref={barRef} className="relative border-t border-bolt-elements-borderColor bg-gray-100 dark:bg-gray-900">
+      {/* Toggle bar — always visible */}
+      <div className="w-full flex items-center px-4 py-2 text-sm gap-2">
+        {/* Clickable label area */}
+        <button
+          onClick={() => {
+            if (!isOpen && barRef.current) {
+              const rect = barRef.current.getBoundingClientRect();
+              setPanelStyle({ bottom: window.innerHeight - rect.top, left: rect.left, width: rect.width });
+            }
+
+            setIsOpen((o) => !o);
+          }}
+          className={classNames(
+            'flex items-center gap-2 flex-1 min-w-0 bg-transparent',
+            'text-bolt-elements-textSecondary hover:text-bolt-elements-textPrimary transition-colors',
+          )}
+        >
+          <span className="i-ph:queue w-4 h-4 shrink-0" />
+          <span className="shrink-0">Prompt Queue</span>
           {isRunning && (
             <span className="flex items-center gap-1 text-green-500 text-xs">
               <span className="i-ph:circle-notch w-3 h-3 animate-spin" />
-              <span>{progressLabel || 'Running'}</span>
+              <span>{progressLabel}</span>
             </span>
           )}
           {!isRunning && progressLabel && (
-            <span className="text-xs text-bolt-elements-textTertiary">{progressLabel}</span>
+            <span
+              className={classNames(
+                'text-xs truncate',
+                isPaused ? 'text-yellow-500' : 'text-bolt-elements-textTertiary',
+              )}
+            >
+              {progressLabel}
+            </span>
           )}
-        </span>
-        <span className={classNames('i-ph:caret-down w-4 h-4 transition-transform', isOpen ? 'rotate-180' : '')} />
-      </button>
+        </button>
+
+        {/* Inline action buttons on the collapsed bar */}
+        <div className="flex items-center gap-1 shrink-0">
+          {isRunning && (
+            <button
+              onClick={handleStop}
+              title="Stop after this response"
+              className={classNames(
+                'flex items-center gap-1 px-2 py-1 rounded-lg text-xs',
+                'bg-red-600 hover:bg-red-500 text-white transition-colors',
+              )}
+            >
+              <span className="i-ph:stop w-3.5 h-3.5" />
+              Stop
+            </button>
+          )}
+          {!isRunning && isPaused && (
+            <button
+              onClick={() => {
+                if (!isStreaming) {
+                  resumeQueue();
+                } else {
+                  toast.error('Wait for the current response to finish');
+                }
+              }}
+              title="Resume from current step"
+              className={classNames(
+                'flex items-center gap-1 px-2 py-1 rounded-lg text-xs',
+                'bg-green-600 hover:bg-green-500 text-white transition-colors',
+              )}
+            >
+              <span className="i-ph:play w-3.5 h-3.5" />
+              Resume
+            </button>
+          )}
+          {!isRunning && hasPrompts && !isAllDone && !isPaused && (
+            <button
+              onClick={() => {
+                if (!isStreaming) {
+                  startQueue();
+                } else {
+                  toast.error('Wait for the current response to finish');
+                }
+              }}
+              title="Start queue"
+              className={classNames(
+                'flex items-center gap-1 px-2 py-1 rounded-lg text-xs',
+                'bg-green-600 hover:bg-green-500 text-white transition-colors',
+              )}
+            >
+              <span className="i-ph:play w-3.5 h-3.5" />
+              Start
+            </button>
+          )}
+        </div>
+
+        <button
+          onClick={() => {
+            if (!isOpen && barRef.current) {
+              const rect = barRef.current.getBoundingClientRect();
+              setPanelStyle({ bottom: window.innerHeight - rect.top, left: rect.left, width: rect.width });
+            }
+
+            setIsOpen((o) => !o);
+          }}
+          className="text-bolt-elements-textSecondary hover:text-bolt-elements-textPrimary transition-colors shrink-0"
+        >
+          <span
+            className={classNames('i-ph:caret-down w-4 h-4 transition-transform block', isOpen ? 'rotate-180' : '')}
+          />
+        </button>
+      </div>
 
       {/* Expandable body — floats ABOVE the toggle, does not push chat layout */}
       {isOpen && (
         <div
+          style={panelStyle}
           className={classNames(
-            'absolute bottom-full left-0 right-0 z-50',
-            'mb-1 mx-2 rounded-xl',
+            'fixed z-[9999]',
+            'mb-1 rounded-xl',
             'bg-bolt-elements-background-depth-2 border border-bolt-elements-borderColor',
             'shadow-lg px-4 pb-4 pt-3 flex flex-col gap-3',
+            'max-h-[80vh] overflow-y-auto modern-scrollbar',
           )}
         >
           {/* Tip */}
@@ -154,7 +246,7 @@ export function PromptQueuePanel({ isStreaming }: PromptQueuePanelProps) {
           />
 
           {/* Controls */}
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <button
               onClick={handleLoad}
               disabled={isRunning || !draft.trim()}
@@ -169,10 +261,16 @@ export function PromptQueuePanel({ isStreaming }: PromptQueuePanelProps) {
               Load
             </button>
 
-            {!isRunning ? (
+            {!isRunning && isPaused && (
               <button
-                onClick={handleStart}
-                disabled={prompts.length === 0 || isStreaming}
+                onClick={() => {
+                  if (!isStreaming) {
+                    resumeQueue();
+                  } else {
+                    toast.error('Wait for the current response to finish');
+                  }
+                }}
+                disabled={isStreaming}
                 className={classNames(
                   'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm',
                   'bg-green-600 hover:bg-green-500 text-white',
@@ -180,9 +278,11 @@ export function PromptQueuePanel({ isStreaming }: PromptQueuePanelProps) {
                 )}
               >
                 <span className="i-ph:play w-4 h-4" />
-                Start
+                Resume
               </button>
-            ) : (
+            )}
+
+            {isRunning && (
               <button
                 onClick={handleStop}
                 className={classNames(
@@ -195,7 +295,24 @@ export function PromptQueuePanel({ isStreaming }: PromptQueuePanelProps) {
               </button>
             )}
 
-            {prompts.length > 0 && !isRunning && (
+            {hasPrompts && (
+              <button
+                onClick={handleClear}
+                disabled={isRunning}
+                title="Clear queue"
+                className={classNames(
+                  'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm',
+                  'bg-bolt-elements-background-depth-3 border border-bolt-elements-borderColor',
+                  'text-bolt-elements-textSecondary hover:text-red-400 hover:border-red-400',
+                  'disabled:opacity-40 disabled:cursor-not-allowed transition-colors',
+                )}
+              >
+                <span className="i-ph:trash w-4 h-4" />
+                Clear
+              </button>
+            )}
+
+            {hasPrompts && !isRunning && (
               <span className="ml-auto text-xs text-bolt-elements-textTertiary">{progressLabel}</span>
             )}
           </div>
