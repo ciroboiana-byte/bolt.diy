@@ -312,6 +312,20 @@ export class ActionRunner {
       unreachable('Expected shell action');
     }
 
+    /*
+     * Apply the same hanging-command intercept used by #runShellAction.
+     * Start actions (expo start, npm run dev, etc.) are fire-and-forget in
+     * WebContainer but for local/native projects they simply hang forever and
+     * lock the browser. Intercepting here prevents the hang before the
+     * WebContainer process is even spawned.
+     */
+    const blockCheck = await this.#validateShellCommand(action.content);
+
+    if (blockCheck.shouldModify && blockCheck.modifiedCommand) {
+      // Replace with safe echo — completes immediately, no hang
+      action.content = blockCheck.modifiedCommand;
+    }
+
     if (!this.#shellTerminal) {
       unreachable('Shell terminal not found');
     }
@@ -612,39 +626,58 @@ export class ActionRunner {
     const trimmedCommand = command.trim();
 
     /*
-     * Blocklist for commands that hang or are meaningless in WebContainer
-     * for local/native projects (React Native, Expo, etc.).
-     * Enabled via the "Block install/server commands" toggle in LocalLLMPanel.
+     * Intercept commands that hang WebContainer or are meaningless for
+     * local/native projects (React Native, Expo, etc.).
+     *
+     * These are ALWAYS intercepted — no localStorage flag needed — because
+     * letting them run freezes the browser. We redirect to a safe `echo`
+     * instead of throwing so the action completes cleanly with exit code 0,
+     * avoiding error-cascade / UI-alert spam that can itself crash the tab.
+     *
+     * The user can toggle "Block install/server cmds" to opt out if they
+     * genuinely need these to run (e.g. a web-only project in WebContainer).
      */
-    const STORAGE_KEY = 'local_llm_settings';
+    const HANGING_PATTERNS = [
+      /^(npx\s+)?expo\s+/i, // expo start / run / build / install / publish
+      /^npm\s+(install|i\b|ci\b|add\b|run\s+(start|dev|build|ios|android))/i,
+      /^yarn(\s+(install|add|start|dev|build|ios|android)|\s*$)/i, // bare yarn or yarn add/install
+      /^pnpm\s+(install|add|start|dev|build)/i,
+      /^npx\s+react-native\s+(run|start|build)/i,
+      /^react-native\s+(run|start|build)/i,
+    ];
 
-    try {
-      const saved = typeof localStorage !== 'undefined' ? localStorage.getItem(STORAGE_KEY) : null;
-      const blockEnabled = saved ? (JSON.parse(saved).blockHangingCommands ?? false) : false;
+    const isHangingCommand = HANGING_PATTERNS.some((p) => p.test(trimmedCommand));
+
+    if (isHangingCommand) {
+      /*
+       * Check the user's toggle — defaults to ON (true) so new installs are
+       * safe out of the box. Only skip the intercept if the user explicitly
+       * disabled the setting.
+       */
+      let blockEnabled = true;
+
+      try {
+        const saved = typeof localStorage !== 'undefined' ? localStorage.getItem('local_llm_settings') : null;
+
+        if (saved) {
+          const parsed = JSON.parse(saved);
+
+          // Explicit false overrides; anything else (missing key, true) keeps the block on
+          blockEnabled = parsed.blockHangingCommands !== false;
+        }
+      } catch {
+        /* localStorage unavailable — keep block on */
+      }
 
       if (blockEnabled) {
-        const BLOCKED_PATTERNS = [
-          /^(npx\s+)?expo\s+(start|run|build|publish)/i,
-          /^npm\s+(install|i|ci|run\s+start|run\s+dev|run\s+build|start)/i,
-          /^yarn(\s+(install|start|dev|build))?$/i,
-          /^pnpm\s+(install|start|dev|build)/i,
-          /^node\s+/i,
-          /^npx\s+react-native\s+(run|start|build)/i,
-        ];
+        logger.warn(`Intercepted hanging command — redirecting to echo: ${trimmedCommand}`);
 
-        for (const pattern of BLOCKED_PATTERNS) {
-          if (pattern.test(trimmedCommand)) {
-            logger.warn(`Blocked shell command (install/server blocklist): ${trimmedCommand}`);
-            return {
-              shouldModify: false,
-              shouldBlock: true,
-              blockReason: `Command blocked: "${trimmedCommand}" — install and server commands are disabled for local/native projects. Run this manually in your local terminal.`,
-            };
-          }
-        }
+        // Replace with a safe echo so the action exits 0 and the queue continues
+        return {
+          shouldModify: true,
+          modifiedCommand: `echo "⚠️  Skipped (WebContainer): ${trimmedCommand.replace(/"/g, "'")} — run this in your local terminal instead"`,
+        };
       }
-    } catch {
-      /* localStorage unavailable (SSR) — skip blocklist check */
     }
 
     // Handle rm commands that might fail due to missing files

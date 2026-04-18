@@ -110,6 +110,75 @@ interface ChatProps {
   description?: string;
 }
 
+/**
+ * Trims the WebContainer file map before it is JSON-serialised into the
+ * request body. Without this, a large ZIP import (hundreds of source files,
+ * or worse — a project that includes node_modules / android / ios) can produce
+ * a multi-megabyte body that freezes the main thread for several seconds every
+ * time the user hits Send.
+ *
+ * Rules (applied in order):
+ *  1. Skip folder entries in heavy directories — they add no value.
+ *  2. Skip any file whose path lives under a "never-send" directory.
+ *  3. Skip any file whose content exceeds MAX_FILE_BYTES.
+ *  4. Stop adding files once the running total exceeds MAX_TOTAL_BYTES.
+ *
+ * Source files (< 50 KB each) are almost always included; compiled bundles,
+ * lock files, and native code are excluded.
+ */
+function trimFilesForBody(fileMap: Record<string, any>): Record<string, any> {
+  const BLOCKED_DIRS = [
+    'node_modules/',
+    '.git/',
+    'dist/',
+    'build/',
+    '.expo/',
+    'android/',
+    'ios/',
+    '.gradle/',
+    '.idea/',
+    '__pycache__/',
+  ];
+  const MAX_FILE_BYTES = 50_000; // 50 KB per file — compiled artefacts tend to be larger
+  const MAX_TOTAL_BYTES = 500_000; // 500 KB total across all files
+
+  let totalBytes = 0;
+  const result: Record<string, any> = {};
+
+  for (const [path, dirent] of Object.entries(fileMap)) {
+    if (!dirent) {
+      continue;
+    }
+
+    // Always skip paths inside heavy directories
+    if (BLOCKED_DIRS.some((d) => path.includes(d))) {
+      continue;
+    }
+
+    if (dirent.type === 'folder') {
+      result[path] = dirent;
+      continue;
+    }
+
+    // File entry — gate on size
+    const content: string = typeof dirent.content === 'string' ? dirent.content : '';
+    const bytes = content.length;
+
+    if (bytes > MAX_FILE_BYTES) {
+      continue; // individual file too large
+    }
+
+    if (totalBytes + bytes > MAX_TOTAL_BYTES) {
+      continue; // total budget exhausted — skip remaining files
+    }
+
+    totalBytes += bytes;
+    result[path] = dirent;
+  }
+
+  return result;
+}
+
 export const ChatImpl = memo(
   ({ description, initialMessages, storeMessageHistory, importChat, exportChat }: ChatProps) => {
     useShortcuts();
@@ -168,7 +237,7 @@ export const ChatImpl = memo(
       api: '/api/chat',
       body: {
         apiKeys,
-        files,
+        files: trimFilesForBody(files),
         promptId: effectivePromptId,
 
         /*
@@ -462,6 +531,54 @@ export const ChatImpl = memo(
       }
     }, []);
 
+    /*
+     * Pre-send ZIP compaction.
+     *
+     * The boltArtifact id="imported-files" message can be hundreds of KB of
+     * raw file content. The onFinish handler compacts it AFTER the response,
+     * but on the VERY FIRST prompt it's still in the messages array when
+     * JSON.stringify is called to build the fetch body. That stringify blocks
+     * the main thread for several seconds, freezing the UI.
+     *
+     * setMessages() in @ai-sdk/react updates messagesRef.current synchronously
+     * (confirmed in the SDK source) before scheduling a re-render. Calling it
+     * immediately before append() means the hook reads the compacted array when
+     * it builds the request body — same content, a fraction of the size.
+     *
+     * Uses the functional form so it always reads the live ref (safe inside
+     * stale-closure callbacks like the queue subscription below).
+     */
+    const compactZipIfPresent = useCallback(() => {
+      setMessages((prev) => {
+        const hasZip = prev.some(
+          (m) => typeof m.content === 'string' && m.content.includes('boltArtifact id="imported-files"'),
+        );
+
+        if (!hasZip) {
+          return prev;
+        }
+
+        return prev.map((m) => {
+          if (typeof m.content !== 'string' || !m.content.includes('boltArtifact id="imported-files"')) {
+            return m;
+          }
+
+          const paths = [...m.content.matchAll(/filePath="([^"]+)"/g)].map((match) => match[1]);
+          const count = paths.length;
+          const list = paths.map((p) => `  ${p}`).join('\n');
+
+          return {
+            ...m,
+            content:
+              `[Project imported to WebContainer — ${count} file${count === 1 ? '' : 's'}]\n\n` +
+              `Files available:\n${list}\n\n` +
+              `All files are in the WebContainer filesystem. ` +
+              `Use context selection to read relevant files as needed.`,
+          };
+        });
+      });
+    }, [setMessages]);
+
     /* Fire the next queued prompt whenever the store signals one is ready */
     useEffect(() => {
       const unsubscribe = promptQueueStore.subscribe((state) => {
@@ -469,12 +586,13 @@ export const ChatImpl = memo(
           clearPendingPrompt();
 
           const messageText = `[Model: ${model}]\n\n[Provider: ${provider.name}]\n\n${state.pendingPrompt}`;
+          compactZipIfPresent();
           append({ role: 'user', content: messageText });
         }
       });
 
       return unsubscribe;
-    }, [append, model, provider]);
+    }, [append, compactZipIfPresent, model, provider]);
 
     useEffect(() => {
       processSampledMessages({
@@ -795,6 +913,7 @@ export const ChatImpl = memo(
         const attachmentOptions =
           uploadedFiles.length > 0 ? { experimental_attachments: await filesToAttachments(uploadedFiles) } : undefined;
 
+        compactZipIfPresent();
         append(
           {
             role: 'user',
@@ -811,6 +930,7 @@ export const ChatImpl = memo(
         const attachmentOptions =
           uploadedFiles.length > 0 ? { experimental_attachments: await filesToAttachments(uploadedFiles) } : undefined;
 
+        compactZipIfPresent();
         append(
           {
             role: 'user',

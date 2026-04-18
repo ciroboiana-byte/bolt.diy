@@ -116,7 +116,48 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
         let summary: string | undefined = undefined;
         let messageSliceId = 0;
 
-        const processedMessages = await mcpService.processToolInvocations(messages, dataStream);
+        /*
+         * Compact any unprocessed ZIP-import artifact before handing messages to
+         * any LLM pass (createSummary, selectContext, streamText).
+         *
+         * On the FIRST prompt after a large ZIP import the chat history still
+         * contains a boltArtifact with the full content of every imported file —
+         * often 50 000+ tokens for a real project. Sending that to a 7 B local
+         * model causes multi-minute TTFT (or a stream timeout + retry loop).
+         *
+         * The client-side onFinish handler does the same replacement AFTER the
+         * response, but by then the damage is already done.  Here we intercept
+         * server-side so the LLM only ever sees the compact file-list summary.
+         *
+         * Safe to run on every request: the regex is O(n) on message length and
+         * skips messages that don't contain the import marker.
+         */
+        const rawMessages = await mcpService.processToolInvocations(messages, dataStream);
+
+        let hadZipCompaction = false;
+
+        const processedMessages = rawMessages.map((m) => {
+          if (
+            m.role === 'assistant' &&
+            typeof m.content === 'string' &&
+            m.content.includes('boltArtifact id="imported-files"')
+          ) {
+            hadZipCompaction = true;
+            const paths = [...m.content.matchAll(/filePath="([^"]+)"/g)].map((match) => match[1]);
+            const count = paths.length;
+            const list = paths.map((p) => `  ${p}`).join('\n');
+            return {
+              ...m,
+              content:
+                `[Project imported to WebContainer — ${count} file${count === 1 ? '' : 's'}]\n\n` +
+                `Files available:\n${list}\n\n` +
+                `All files are in the WebContainer filesystem. ` +
+                `Use context selection to read relevant files as needed.`,
+            };
+          }
+
+          return m;
+        });
 
         if (processedMessages.length > 3) {
           messageSliceId = processedMessages.length - 3;
@@ -299,6 +340,54 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
           } satisfies ProgressAnnotation);
 
           // logger.debug('Code Files Selected');
+        }
+
+        /*
+         * ZIP-import keyword fallback — runs when contextOptimization is OFF
+         * (e.g. "Skip context pre-pass" enabled in Local Models panel) but the
+         * current request contains a compacted ZIP import in history.
+         *
+         * Without this, the model would receive the compact file-list summary
+         * but NO actual file content — leaving it blind and producing garbage
+         * responses ("Sure! Understood.") or trying to run npm install.
+         *
+         * We extract keywords from the latest user message and inject only the
+         * files whose paths match, giving the model relevant context without
+         * the cost of a full LLM pre-pass.
+         */
+        if (hadZipCompaction && !filteredFiles && files && filePaths.length > 0) {
+          logger.debug('ZIP import detected with contextOptimization off — running keyword fallback');
+
+          const lastUserMsg = [...processedMessages].reverse().find((m) => m.role === 'user');
+          const msgText = typeof lastUserMsg?.content === 'string' ? lastUserMsg.content.toLowerCase() : '';
+
+          const keywords = [
+            ...(msgText.match(/[\w/-]+\.\w+/g) ?? []), // file.ext patterns
+            ...(msgText.match(/[A-Z][a-zA-Z]{2,}/g) ?? []), // ComponentNames
+            ...(msgText.match(/\b(app|index|main|screen|hook|util|type|context|store|nav)\w*/gi) ?? []),
+          ].map((k) => k.toLowerCase());
+
+          const ALWAYS_INCLUDE = ['package.json', 'app.json', 'app.tsx', 'app.jsx', 'index.tsx', 'index.js'];
+
+          const candidate = Object.fromEntries(
+            Object.entries(files).filter(([path]) => {
+              const lpath = path.toLowerCase();
+              return (
+                ALWAYS_INCLUDE.some((f) => lpath.endsWith(f)) ||
+                keywords.some((kw) => kw.length > 3 && lpath.includes(kw))
+              );
+            }),
+          ) as FileMap;
+
+          // Fall back to all files only if nothing matched — avoids complete blindness
+          filteredFiles = Object.keys(candidate).length > 0 ? candidate : undefined;
+
+          if (filteredFiles) {
+            logger.debug(`ZIP fallback context files: ${JSON.stringify(Object.keys(filteredFiles))}`);
+          } else {
+            logger.debug('ZIP fallback: no keyword matches, injecting full file set');
+            filteredFiles = files as FileMap;
+          }
         }
 
         const options: StreamingOptions = {

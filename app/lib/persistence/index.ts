@@ -1,3 +1,4 @@
 export * from './localStorage';
-export * from './db';
+export * from './serverDb';
+export type { IChatMetadata } from './db';
 export * from './useChatHistory';
