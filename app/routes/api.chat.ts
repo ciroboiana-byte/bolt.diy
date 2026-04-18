@@ -143,9 +143,11 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
             m.content.includes('boltArtifact id="imported-files"')
           ) {
             hadZipCompaction = true;
+
             const paths = [...m.content.matchAll(/filePath="([^"]+)"/g)].map((match) => match[1]);
             const count = paths.length;
             const list = paths.map((p) => `  ${p}`).join('\n');
+
             return {
               ...m,
               content:
