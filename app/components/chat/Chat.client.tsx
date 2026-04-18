@@ -200,6 +200,24 @@ export const ChatImpl = memo(
       chatStore.setKey('started', initialMessages.length > 0);
     }, []);
 
+    /*
+     * Pre-fill the textarea with the follow-up prompt set by ImportZipButton before the
+     * full-page navigation. Using setInput instead of append so the user confirms with
+     * one Enter keystroke — avoids model-state race conditions on chat initialisation.
+     */
+    useEffect(() => {
+      if (initialMessages.length === 0) {
+        return;
+      }
+
+      const autorun = localStorage.getItem('bolt_zip_autorun');
+
+      if (autorun) {
+        localStorage.removeItem('bolt_zip_autorun');
+        setInput(autorun);
+      }
+    }, []);
+
     useEffect(() => {
       processSampledMessages({
         messages,
