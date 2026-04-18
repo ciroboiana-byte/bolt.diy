@@ -28,6 +28,7 @@ import type { ProgressAnnotation } from '~/types/context';
 import { SupabaseChatAlert } from '~/components/chat/SupabaseAlert';
 import { expoUrlAtom } from '~/lib/stores/qrCodeStore';
 import { useStore } from '@nanostores/react';
+import { PromptQueuePanel } from './PromptQueuePanel';
 import { StickToBottom, useStickToBottomContext } from '~/lib/hooks';
 import { ChatBox } from './ChatBox';
 import type { DesignScheme } from '~/types/design-scheme';
@@ -469,6 +470,7 @@ export const BaseChat = React.forwardRef<HTMLDivElement, BaseChatProps>(
                   setSelectedElement={setSelectedElement}
                   onWebSearchResult={onWebSearchResult}
                 />
+                {chatStarted && <PromptQueuePanel isStreaming={isStreaming} />}
               </div>
             </StickToBottom>
             <div className="flex flex-col justify-center">
