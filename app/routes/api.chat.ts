@@ -40,32 +40,49 @@ function parseCookies(cookieHeader: string): Record<string, string> {
 }
 
 async function chatAction({ context, request }: ActionFunctionArgs) {
+  const {
+    messages,
+    files,
+    promptId,
+    contextOptimization,
+    supabase,
+    chatMode,
+    designScheme,
+    maxLLMSteps,
+    isLocalModel,
+  } = await request.json<{
+    messages: Messages;
+    files: any;
+    promptId?: string;
+    contextOptimization: boolean;
+    chatMode: 'discuss' | 'build';
+    designScheme?: DesignScheme;
+    supabase?: {
+      isConnected: boolean;
+      hasSelectedProject: boolean;
+      credentials?: {
+        anonKey?: string;
+        supabaseUrl?: string;
+      };
+    };
+    maxLLMSteps: number;
+
+    /** True when routing to a local model (Ollama / LMStudio) — uses a longer stream timeout */
+    isLocalModel?: boolean;
+  }>();
+
+  /*
+   * Local models (Ollama / LMStudio) can take 60–90 s before the first token
+   * arrives while the model loads context. Cloud APIs are fast so 45 s is fine.
+   * The timeout resets on every token, so this only affects pre-generation silence.
+   */
   const streamRecovery = new StreamRecoveryManager({
-    timeout: 45000,
+    timeout: isLocalModel ? 180000 : 45000,
     maxRetries: 2,
     onTimeout: () => {
       logger.warn('Stream timeout - attempting recovery');
     },
   });
-
-  const { messages, files, promptId, contextOptimization, supabase, chatMode, designScheme, maxLLMSteps } =
-    await request.json<{
-      messages: Messages;
-      files: any;
-      promptId?: string;
-      contextOptimization: boolean;
-      chatMode: 'discuss' | 'build';
-      designScheme?: DesignScheme;
-      supabase?: {
-        isConnected: boolean;
-        hasSelectedProject: boolean;
-        credentials?: {
-          anonKey?: string;
-          supabaseUrl?: string;
-        };
-      };
-      maxLLMSteps: number;
-    }>();
 
   const cookieHeader = request.headers.get('Cookie');
   const apiKeys = JSON.parse(parseCookies(cookieHeader || '').apiKeys || '{}');
@@ -99,7 +116,50 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
         let summary: string | undefined = undefined;
         let messageSliceId = 0;
 
-        const processedMessages = await mcpService.processToolInvocations(messages, dataStream);
+        /*
+         * Compact any unprocessed ZIP-import artifact before handing messages to
+         * any LLM pass (createSummary, selectContext, streamText).
+         *
+         * On the FIRST prompt after a large ZIP import the chat history still
+         * contains a boltArtifact with the full content of every imported file —
+         * often 50 000+ tokens for a real project. Sending that to a 7 B local
+         * model causes multi-minute TTFT (or a stream timeout + retry loop).
+         *
+         * The client-side onFinish handler does the same replacement AFTER the
+         * response, but by then the damage is already done.  Here we intercept
+         * server-side so the LLM only ever sees the compact file-list summary.
+         *
+         * Safe to run on every request: the regex is O(n) on message length and
+         * skips messages that don't contain the import marker.
+         */
+        const rawMessages = await mcpService.processToolInvocations(messages, dataStream);
+
+        let hadZipCompaction = false;
+
+        const processedMessages = rawMessages.map((m) => {
+          if (
+            m.role === 'assistant' &&
+            typeof m.content === 'string' &&
+            m.content.includes('boltArtifact id="imported-files"')
+          ) {
+            hadZipCompaction = true;
+
+            const paths = [...m.content.matchAll(/filePath="([^"]+)"/g)].map((match) => match[1]);
+            const count = paths.length;
+            const list = paths.map((p) => `  ${p}`).join('\n');
+
+            return {
+              ...m,
+              content:
+                `[Project imported to WebContainer — ${count} file${count === 1 ? '' : 's'}]\n\n` +
+                `Files available:\n${list}\n\n` +
+                `All files are in the WebContainer filesystem. ` +
+                `Use context selection to read relevant files as needed.`,
+            };
+          }
+
+          return m;
+        });
 
         if (processedMessages.length > 3) {
           messageSliceId = processedMessages.length - 3;
@@ -115,38 +175,70 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
             message: 'Analysing Request',
           } satisfies ProgressAnnotation);
 
+          /*
+           * Wrap both LLM pre-passes in a timeout so local models (Ollama / LMStudio)
+           * degrade gracefully instead of hanging the stream.
+           *
+           * - isLocalModel=true  → 45 s timeout, falls back to keyword-based selection
+           * - isLocalModel=false → 120 s timeout (cloud APIs are fast, but still capped)
+           *
+           * Keyword fallback: scan the latest user message for file-path fragments and
+           * component/function names, then include only files whose paths contain a match.
+           * No extra LLM call needed.
+           */
+          const CONTEXT_TIMEOUT_MS = isLocalModel ? 45_000 : 120_000;
+
+          const withTimeout = <T>(promise: Promise<T>, ms: number, label: string): Promise<T | null> =>
+            Promise.race([
+              promise,
+              new Promise<null>((resolve) =>
+                setTimeout(() => {
+                  logger.warn(`${label} timed out after ${ms}ms — falling back`);
+                  resolve(null);
+                }, ms),
+              ),
+            ]);
+
           // Create a summary of the chat
           console.log(`Messages count: ${processedMessages.length}`);
 
-          summary = await createSummary({
-            messages: [...processedMessages],
-            env: context.cloudflare?.env,
-            apiKeys,
-            providerSettings,
-            promptId,
-            contextOptimization,
-            onFinish(resp) {
-              if (resp.usage) {
-                logger.debug('createSummary token usage', JSON.stringify(resp.usage));
-                cumulativeUsage.completionTokens += resp.usage.completionTokens || 0;
-                cumulativeUsage.promptTokens += resp.usage.promptTokens || 0;
-                cumulativeUsage.totalTokens += resp.usage.totalTokens || 0;
-              }
-            },
-          });
+          const summaryResult = await withTimeout(
+            createSummary({
+              messages: [...processedMessages],
+              env: context.cloudflare?.env,
+              apiKeys,
+              providerSettings,
+              promptId,
+              contextOptimization,
+              onFinish(resp) {
+                if (resp.usage) {
+                  logger.debug('createSummary token usage', JSON.stringify(resp.usage));
+                  cumulativeUsage.completionTokens += resp.usage.completionTokens || 0;
+                  cumulativeUsage.promptTokens += resp.usage.promptTokens || 0;
+                  cumulativeUsage.totalTokens += resp.usage.totalTokens || 0;
+                }
+              },
+            }),
+            CONTEXT_TIMEOUT_MS,
+            'createSummary',
+          );
+          summary = summaryResult ?? undefined;
+
           dataStream.writeData({
             type: 'progress',
             label: 'summary',
             status: 'complete',
             order: progressCounter++,
-            message: 'Analysis Complete',
+            message: summary ? 'Analysis Complete' : 'Analysis skipped (timeout)',
           } satisfies ProgressAnnotation);
 
-          dataStream.writeMessageAnnotation({
-            type: 'chatSummary',
-            summary,
-            chatId: processedMessages.slice(-1)?.[0]?.id,
-          } as ContextAnnotation);
+          if (summary) {
+            dataStream.writeMessageAnnotation({
+              type: 'chatSummary',
+              summary,
+              chatId: processedMessages.slice(-1)?.[0]?.id,
+            } as ContextAnnotation);
+          }
 
           // Update context buffer
           logger.debug('Updating Context Buffer');
@@ -160,24 +252,69 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
 
           // Select context files
           console.log(`Messages count: ${processedMessages.length}`);
-          filteredFiles = await selectContext({
-            messages: [...processedMessages],
-            env: context.cloudflare?.env,
-            apiKeys,
-            files,
-            providerSettings,
-            promptId,
-            contextOptimization,
-            summary,
-            onFinish(resp) {
-              if (resp.usage) {
-                logger.debug('selectContext token usage', JSON.stringify(resp.usage));
-                cumulativeUsage.completionTokens += resp.usage.completionTokens || 0;
-                cumulativeUsage.promptTokens += resp.usage.promptTokens || 0;
-                cumulativeUsage.totalTokens += resp.usage.totalTokens || 0;
-              }
-            },
-          });
+
+          if (summary) {
+            // Full LLM-based context selection
+            const selectResult = await withTimeout(
+              selectContext({
+                messages: [...processedMessages],
+                env: context.cloudflare?.env,
+                apiKeys,
+                files,
+                providerSettings,
+                promptId,
+                contextOptimization,
+                summary,
+                onFinish(resp) {
+                  if (resp.usage) {
+                    logger.debug('selectContext token usage', JSON.stringify(resp.usage));
+                    cumulativeUsage.completionTokens += resp.usage.completionTokens || 0;
+                    cumulativeUsage.promptTokens += resp.usage.promptTokens || 0;
+                    cumulativeUsage.totalTokens += resp.usage.totalTokens || 0;
+                  }
+                },
+              }),
+              CONTEXT_TIMEOUT_MS,
+              'selectContext',
+            );
+            filteredFiles = selectResult ?? undefined;
+          }
+
+          /*
+           * Keyword fallback — used when the LLM pre-pass timed out or returned nothing.
+           * Extracts terms from the latest user message and matches against file paths.
+           * Always includes files that are short/critical (package.json, app entry points).
+           */
+          if (!filteredFiles && files) {
+            logger.debug('Using keyword fallback for context selection');
+
+            const lastUserMsg = [...processedMessages].reverse().find((m) => m.role === 'user');
+            const msgText = typeof lastUserMsg?.content === 'string' ? lastUserMsg.content.toLowerCase() : '';
+
+            // Extract candidate keywords: path-like tokens and CamelCase identifiers
+            const keywords = [
+              ...(msgText.match(/[\w/-]+\.\w+/g) ?? []), // file.ext patterns
+              ...(msgText.match(/[A-Z][a-zA-Z]{2,}/g) ?? []), // ComponentNames
+              ...(msgText.match(/\b(app|index|main|screen|hook|util|type|context|store|nav)\w*/gi) ?? []),
+            ].map((k) => k.toLowerCase());
+
+            const ALWAYS_INCLUDE = ['package.json', 'app.json', 'app.tsx', 'app.jsx', 'index.tsx', 'index.js'];
+
+            filteredFiles = Object.fromEntries(
+              Object.entries(files).filter(([path]) => {
+                const lpath = path.toLowerCase();
+                return (
+                  ALWAYS_INCLUDE.some((f) => lpath.endsWith(f)) ||
+                  keywords.some((kw) => kw.length > 3 && lpath.includes(kw))
+                );
+              }),
+            ) as FileMap;
+
+            // If nothing matched at all, include everything (safe fallback)
+            if (Object.keys(filteredFiles).length === 0) {
+              filteredFiles = undefined;
+            }
+          }
 
           if (filteredFiles) {
             logger.debug(`files in context : ${JSON.stringify(Object.keys(filteredFiles))}`);
@@ -185,7 +322,7 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
 
           dataStream.writeMessageAnnotation({
             type: 'codeContext',
-            files: Object.keys(filteredFiles).map((key) => {
+            files: Object.keys(filteredFiles ?? {}).map((key) => {
               let path = key;
 
               if (path.startsWith(WORK_DIR)) {
@@ -205,6 +342,54 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
           } satisfies ProgressAnnotation);
 
           // logger.debug('Code Files Selected');
+        }
+
+        /*
+         * ZIP-import keyword fallback — runs when contextOptimization is OFF
+         * (e.g. "Skip context pre-pass" enabled in Local Models panel) but the
+         * current request contains a compacted ZIP import in history.
+         *
+         * Without this, the model would receive the compact file-list summary
+         * but NO actual file content — leaving it blind and producing garbage
+         * responses ("Sure! Understood.") or trying to run npm install.
+         *
+         * We extract keywords from the latest user message and inject only the
+         * files whose paths match, giving the model relevant context without
+         * the cost of a full LLM pre-pass.
+         */
+        if (hadZipCompaction && !filteredFiles && files && filePaths.length > 0) {
+          logger.debug('ZIP import detected with contextOptimization off — running keyword fallback');
+
+          const lastUserMsg = [...processedMessages].reverse().find((m) => m.role === 'user');
+          const msgText = typeof lastUserMsg?.content === 'string' ? lastUserMsg.content.toLowerCase() : '';
+
+          const keywords = [
+            ...(msgText.match(/[\w/-]+\.\w+/g) ?? []), // file.ext patterns
+            ...(msgText.match(/[A-Z][a-zA-Z]{2,}/g) ?? []), // ComponentNames
+            ...(msgText.match(/\b(app|index|main|screen|hook|util|type|context|store|nav)\w*/gi) ?? []),
+          ].map((k) => k.toLowerCase());
+
+          const ALWAYS_INCLUDE = ['package.json', 'app.json', 'app.tsx', 'app.jsx', 'index.tsx', 'index.js'];
+
+          const candidate = Object.fromEntries(
+            Object.entries(files).filter(([path]) => {
+              const lpath = path.toLowerCase();
+              return (
+                ALWAYS_INCLUDE.some((f) => lpath.endsWith(f)) ||
+                keywords.some((kw) => kw.length > 3 && lpath.includes(kw))
+              );
+            }),
+          ) as FileMap;
+
+          // Fall back to all files only if nothing matched — avoids complete blindness
+          filteredFiles = Object.keys(candidate).length > 0 ? candidate : undefined;
+
+          if (filteredFiles) {
+            logger.debug(`ZIP fallback context files: ${JSON.stringify(Object.keys(filteredFiles))}`);
+          } else {
+            logger.debug('ZIP fallback: no keyword matches, injecting full file set');
+            filteredFiles = files as FileMap;
+          }
         }
 
         const options: StreamingOptions = {

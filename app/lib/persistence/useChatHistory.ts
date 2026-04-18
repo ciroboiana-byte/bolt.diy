@@ -9,14 +9,14 @@ import {
   getMessages,
   getNextId,
   getUrlId,
-  openDatabase,
+  openServerDatabase as openDatabase,
   setMessages,
   duplicateChat,
   createChatFromMessages,
   getSnapshot,
   setSnapshot,
-  type IChatMetadata,
-} from './db';
+} from './serverDb';
+import type { IChatMetadata } from './db';
 import type { FileMap } from '~/lib/stores/files';
 import type { Snapshot } from './types';
 import { webcontainer } from '~/lib/webcontainer';
@@ -215,8 +215,11 @@ ${value.content}
       try {
         await setSnapshot(db, id, snapshot);
       } catch (error) {
-        console.error('Failed to save snapshot:', error);
-        toast.error('Failed to save chat snapshot.');
+        /*
+         * Log silently — snapshot failures under memory pressure are not actionable
+         * and firing toasts causes a cascade that makes the UI unusable.
+         */
+        console.warn('Failed to save snapshot (suppressed toast):', error);
       }
     },
     [db],

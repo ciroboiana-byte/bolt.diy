@@ -262,15 +262,43 @@ export class ActionRunner {
     // Pre-validate command for common issues
     const validationResult = await this.#validateShellCommand(action.content);
 
+    if (validationResult.shouldBlock) {
+      throw new ActionCommandError('Command blocked', validationResult.blockReason ?? 'Command not allowed');
+    }
+
     if (validationResult.shouldModify && validationResult.modifiedCommand) {
       logger.debug(`Modified command: ${action.content} -> ${validationResult.modifiedCommand}`);
       action.content = validationResult.modifiedCommand;
     }
 
-    const resp = await shell.executeCommand(this.runnerId.get(), action.content, () => {
+    /*
+     * Hard timeout — prevents shell commands from hanging bolt indefinitely.
+     * npm install on a large project, dev servers, or WebContainer init issues
+     * can stall forever without this. 90 s is generous for most installs;
+     * long-running dev-server commands use the 'start' action type instead.
+     */
+    const SHELL_TIMEOUT_MS = 90_000;
+
+    const execPromise = shell.executeCommand(this.runnerId.get(), action.content, () => {
       logger.debug(`[${action.type}]:Aborting Action\n\n`, action);
       action.abort();
     });
+
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(
+        () =>
+          reject(
+            new ActionCommandError(
+              'Shell command timed out',
+              `Command did not complete within ${SHELL_TIMEOUT_MS / 1000}s:\n${action.content}`,
+            ),
+          ),
+        SHELL_TIMEOUT_MS,
+      ),
+    );
+
+    const resp = await Promise.race([execPromise, timeoutPromise]);
+
     logger.debug(`${action.type} Shell Response: [exit code:${resp?.exitCode}]`);
 
     if (resp?.exitCode != 0) {
@@ -282,6 +310,20 @@ export class ActionRunner {
   async #runStartAction(action: ActionState) {
     if (action.type !== 'start') {
       unreachable('Expected shell action');
+    }
+
+    /*
+     * Apply the same hanging-command intercept used by #runShellAction.
+     * Start actions (expo start, npm run dev, etc.) are fire-and-forget in
+     * WebContainer but for local/native projects they simply hang forever and
+     * lock the browser. Intercepting here prevents the hang before the
+     * WebContainer process is even spawned.
+     */
+    const blockCheck = await this.#validateShellCommand(action.content);
+
+    if (blockCheck.shouldModify && blockCheck.modifiedCommand) {
+      // Replace with safe echo — completes immediately, no hang
+      action.content = blockCheck.modifiedCommand;
     }
 
     if (!this.#shellTerminal) {
@@ -576,10 +618,67 @@ export class ActionRunner {
 
   async #validateShellCommand(command: string): Promise<{
     shouldModify: boolean;
+    shouldBlock?: boolean;
+    blockReason?: string;
     modifiedCommand?: string;
     warning?: string;
   }> {
     const trimmedCommand = command.trim();
+
+    /*
+     * Intercept commands that hang WebContainer or are meaningless for
+     * local/native projects (React Native, Expo, etc.).
+     *
+     * These are ALWAYS intercepted — no localStorage flag needed — because
+     * letting them run freezes the browser. We redirect to a safe `echo`
+     * instead of throwing so the action completes cleanly with exit code 0,
+     * avoiding error-cascade / UI-alert spam that can itself crash the tab.
+     *
+     * The user can toggle "Block install/server cmds" to opt out if they
+     * genuinely need these to run (e.g. a web-only project in WebContainer).
+     */
+    const HANGING_PATTERNS = [
+      /^(npx\s+)?expo\s+/i, // expo start / run / build / install / publish
+      /^npm\s+(install|i\b|ci\b|add\b|run\s+(start|dev|build|ios|android))/i,
+      /^yarn(\s+(install|add|start|dev|build|ios|android)|\s*$)/i, // bare yarn or yarn add/install
+      /^pnpm\s+(install|add|start|dev|build)/i,
+      /^npx\s+react-native\s+(run|start|build)/i,
+      /^react-native\s+(run|start|build)/i,
+    ];
+
+    const isHangingCommand = HANGING_PATTERNS.some((p) => p.test(trimmedCommand));
+
+    if (isHangingCommand) {
+      /*
+       * Check the user's toggle — defaults to ON (true) so new installs are
+       * safe out of the box. Only skip the intercept if the user explicitly
+       * disabled the setting.
+       */
+      let blockEnabled = true;
+
+      try {
+        const saved = typeof localStorage !== 'undefined' ? localStorage.getItem('local_llm_settings') : null;
+
+        if (saved) {
+          const parsed = JSON.parse(saved);
+
+          // Explicit false overrides; anything else (missing key, true) keeps the block on
+          blockEnabled = parsed.blockHangingCommands !== false;
+        }
+      } catch {
+        /* localStorage unavailable — keep block on */
+      }
+
+      if (blockEnabled) {
+        logger.warn(`Intercepted hanging command — redirecting to echo: ${trimmedCommand}`);
+
+        // Replace with a safe echo so the action exits 0 and the queue continues
+        return {
+          shouldModify: true,
+          modifiedCommand: `echo "⚠️  Skipped (WebContainer): ${trimmedCommand.replace(/"/g, "'")} — run this in your local terminal instead"`,
+        };
+      }
+    }
 
     // Handle rm commands that might fail due to missing files
     if (trimmedCommand.startsWith('rm ') && !trimmedCommand.includes(' -f')) {

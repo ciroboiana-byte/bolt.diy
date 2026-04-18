@@ -227,15 +227,16 @@ export async function streamText(props: {
     `Model "${modelDetails.name}" is reasoning model: ${isReasoning}, using ${isReasoning ? 'maxCompletionTokens' : 'maxTokens'}: ${safeMaxTokens}`,
   );
 
-  // Validate token limits before API call
-  if (safeMaxTokens > (modelDetails.maxTokenAllowed || 128000)) {
-    logger.warn(
-      `Token limit warning: requesting ${safeMaxTokens} tokens but model supports max ${modelDetails.maxTokenAllowed || 128000}`,
-    );
+  // Clamp to model's reported max to avoid API errors / truncation warnings
+  const modelMax = modelDetails.maxTokenAllowed || 128000;
+  const clampedMaxTokens = Math.min(safeMaxTokens, modelMax);
+
+  if (clampedMaxTokens < safeMaxTokens) {
+    logger.warn(`Token limit clamped: ${safeMaxTokens} → ${clampedMaxTokens} (model max: ${modelMax})`);
   }
 
   // Use maxCompletionTokens for reasoning models (o1, GPT-5), maxTokens for traditional models
-  const tokenParams = isReasoning ? { maxCompletionTokens: safeMaxTokens } : { maxTokens: safeMaxTokens };
+  const tokenParams = isReasoning ? { maxCompletionTokens: clampedMaxTokens } : { maxTokens: clampedMaxTokens };
 
   // Filter out unsupported parameters for reasoning models
   const filteredOptions =

@@ -1,0 +1,10 @@
+This is a React Native / Expo project.
+
+Important constraints:
+- Do NOT run npm install, npx expo start, or any dev server commands — I run this locally with Expo CLI
+- Use React Native components (View, Text, TouchableOpacity, FlatList, etc.) — NOT web HTML elements
+- Use StyleSheet.create() for styles, not CSS or Tailwind
+- Navigation is handled by React Navigation — do not add routing libraries
+- All file I/O and native APIs go through Expo SDK modules
+
+Please review the code structure and give me a summary of what the app does and how it is organized.
