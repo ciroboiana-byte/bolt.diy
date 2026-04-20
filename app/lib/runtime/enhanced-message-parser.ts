@@ -41,8 +41,8 @@ export class EnhancedStreamingMessageParser extends StreamingMessageParser {
       const enhancedInput = this._detectAndWrapCodeBlocks(messageId, input);
 
       if (enhancedInput !== input) {
-        // Reset and reparse with enhanced input
-        this.reset();
+        // Reset only this message's state and reparse with enhanced input
+        this.resetMessage(messageId);
         output = super.parse(messageId, enhancedInput);
       }
     }
@@ -523,5 +523,10 @@ ${content.trim()}
     super.reset();
     this._processedCodeBlocks.clear();
     this._artifactCounter = 0;
+  }
+
+  resetMessage(messageId: string) {
+    super.resetMessage(messageId);
+    this._processedCodeBlocks.delete(messageId);
   }
 }
