@@ -3,6 +3,7 @@ import CerebrasProvider from './providers/cerebras';
 import CohereProvider from './providers/cohere';
 import DeepseekProvider from './providers/deepseek';
 import FireworksProvider from './providers/fireworks';
+import FuturMixProvider from './providers/futurmix';
 import GoogleProvider from './providers/google';
 import GroqProvider from './providers/groq';
 import HuggingFaceProvider from './providers/huggingface';
@@ -27,6 +28,7 @@ export {
   CohereProvider,
   DeepseekProvider,
   FireworksProvider,
+  FuturMixProvider,
   GoogleProvider,
   GroqProvider,
   HuggingFaceProvider,
