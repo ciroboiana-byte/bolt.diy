@@ -16,6 +16,13 @@ export default defineConfig((config) => {
     define: {
       'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV),
     },
+    server: {
+      allowedHosts: [
+        'bolt-diy-nr2c.onrender.com',
+        '.onrender.com',
+        'localhost',
+      ],
+    },
     build: {
       target: 'esnext',
     },
