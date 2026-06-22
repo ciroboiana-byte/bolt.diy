@@ -9,7 +9,7 @@ ENV CI=true
 # Use pnpm
 RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
 
-# Ensure git is available for build and runtime scripts
+# Ensure git is available for build and runtime scripts a
 RUN apt-get update && apt-get install -y --no-install-recommends git \
   && rm -rf /var/lib/apt/lists/*
 
